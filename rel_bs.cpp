@@ -802,8 +802,47 @@ static void run_tests(double S = 100, double K = 100, double T = 1.0,
         fail += !pass;
     }
 
+    // Test 11: Cauchy digital complementarity — C_digital + P_digital = e^{−rT} (exact)
+    {
+        const double gamma_C = 0.20;
+        double cd = cauchy_digital(S, K, T, r, gamma_C, true);
+        double pd = cauchy_digital(S, K, T, r, gamma_C, false);
+        double err = std::abs(cd + pd - std::exp(-r * T));
+        bool pass = (err < 1e-12);
+        std::printf("  [%s] Cauchy digital C+P = e^{-rT}:              "
+                    "err = %.2e\n",
+                    pass ? "PASS" : "FAIL", err);
+        fail += !pass;
+    }
+
+    // Test 12: Cauchy density > RBS density just outside the light cone
+    //   At x = 1.05×c·T (just beyond causal boundary), K_RBS → 0 but K_Cauchy > 0.
+    {
+        const double tr     = 0.10;
+        const double c_lc   = sigma / std::sqrt(2.0 * tr);
+        const double x_pr   = 1.05 * c_lc * T;          // 1.05× outside cone
+        const double K_pr   = S * std::exp(x_pr);        // OTM call side
+        const double dK_fd  = S * 0.02;
+
+        Grid g12 = Grid::make(sigma, T, 400, 9.0);
+        auto pK = [&](double Kk) {
+            return grid_interp(solve_rbs(sigma, r, T, Kk, tr, 400, true, g12),
+                               g12, std::log(S / Kk));
+        };
+        double q_rbs_K = std::max(0.0, std::exp(r * T)
+            * (pK(K_pr - dK_fd) - 2.0 * pK(K_pr) + pK(K_pr + dK_fd))
+            / (dK_fd * dK_fd));
+        double q_rbs_x   = K_pr * q_rbs_K;                      // convert to x-space
+        double q_cauchy_x = cauchy_propagator(x_pr, T, sigma);   // x-space, γ_C = σ
+        bool   pass = (q_cauchy_x > q_rbs_x);
+        std::printf("  [%s] Cauchy > RBS at 1.05× cone boundary:       "
+                    "K_C=%.4f  K_RBS=%.4f\n",
+                    pass ? "PASS" : "FAIL", q_cauchy_x, q_rbs_x);
+        fail += !pass;
+    }
+
     std::printf("  ─────────────────────────────────────────────────────\n");
-    std::printf("  %d/%d tests passed\n\n", 10 - fail, 10);
+    std::printf("  %d/%d tests passed\n\n", 12 - fail, 12);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1288,6 +1327,158 @@ static void print_light_cone(double S, double T, double r, double sigma,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Cauchy distribution switching  (Priority 6)
+//
+//  The Goldstein-Kac (telegrapher) process has a HARD causal boundary at |x|=c·T:
+//  the RBS risk-neutral density is exactly zero outside the light cone (P5).
+//
+//  The Cauchy distribution (α=1 Lévy-stable) is the opposite extreme:
+//    K_C(x, T; γ_C) = (γ_C·T) / (π·(x²+(γ_C·T)²))
+//  Power-law tail ~ 1/x²; density NEVER vanishes; NO causal boundary.
+//
+//  Vanilla Cauchy call prices DIVERGE (E[S_T] = ∞ for Cauchy log-returns), so
+//  only Cauchy DIGITAL options are well-posed:
+//    C_dig = e^{−rT}·P(S_T>K|Cauchy) = e^{−rT}·[½ + arctan(d_C)/π],  d_C=ln(S/K)/(γ_C·T)
+//
+//  Three parts:
+//    Part 1 — Propagator comparison: K_Gaussian vs K_Cauchy vs K_RBS across strikes
+//    Part 2 — Cauchy digital vs BS digital: heavy-tail premium at extreme moneyness
+//    Part 3 — Density mixing at the cone boundary:
+//             K_mix = (1−ρ)·K_RBS + ρ·K_Cauchy; even 10% Cauchy restores density
+//             at causally-forbidden x, illustrating the physical trade-off.
+// ─────────────────────────────────────────────────────────────────────────────
+static void print_cauchy_table(double S, double T, double r, double sigma,
+                                double tau_rel, int Nx = 500, int Nt = 500) {
+    const double gamma_C = sigma;   // set γ_C = σ: fair comparison (same scale)
+    const double c_light = sigma / std::sqrt(2.0 * tau_rel);
+    const double cone_x  = c_light * T;
+    const double ert     = std::exp(r * T);
+    const double sqrtT   = std::sqrt(T);
+
+    // ── K-grid (same design as print_light_cone) ──────────────────────────────
+    const double x_range = std::max(std::min(1.8 * cone_x, 1.4), 0.6);
+    const double K_lo    = S * std::exp(-x_range);
+    const double K_hi    = S * std::exp( x_range);
+    const int    nK      = 81;
+    const double dK      = (K_hi - K_lo) / (nK - 1);
+
+    // Solve RBS for all strikes; compute Breeden-Litzenberger density in x-space
+    Grid g = Grid::make(sigma, T, Nx, 9.0);
+    std::vector<double> K_arr(nK), C_arr(nK), q_rbs_x(nK, 0.0);
+    for (int i = 0; i < nK; ++i) {
+        K_arr[i] = K_lo + i * dK;
+        C_arr[i] = grid_interp(
+            solve_rbs(sigma, r, T, K_arr[i], tau_rel, Nt, true, g),
+            g, std::log(S / K_arr[i]));
+    }
+    for (int i = 1; i < nK - 1; ++i) {
+        double qK = std::max(0.0, ert * (C_arr[i-1] - 2.0*C_arr[i] + C_arr[i+1]) / (dK*dK));
+        q_rbs_x[i] = K_arr[i] * qK;   // Jacobian: density per unit log-return
+    }
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    std::printf("\n  Cauchy Distribution Switching  (P6)\n");
+    std::printf("  γ_C = σ = %.2f  |  τ_rel=%.4f  |  c=%.4f  |  cone |x|=%.4f\n",
+                gamma_C, tau_rel, c_light, cone_x);
+    std::printf("  Vanilla Cauchy call prices diverge → digitals used for comparison.\n");
+
+    // ── Part 1: Propagator comparison ─────────────────────────────────────────
+    std::printf("\n  Part 1: Risk-neutral densities in log-return space\n");
+    std::printf("  K_G = Gaussian propagator (drift-adjusted BS)\n");
+    std::printf("  K_C = Cauchy propagator (γ_C=σ, symmetric, polynomial tail)\n");
+    std::printf("  K_RBS = Numerical RBS density (Breeden-Litzenberger)\n\n");
+
+    std::printf("  %-9s  %-7s  %-12s  %-12s  %-12s  %-8s  %s\n",
+                "x=ln(S/K)", "K", "K_Gaussian", "K_Cauchy", "K_RBS", "K_C/K_G", "Cone");
+    std::printf("  %-9s  %-7s  %-12s  %-12s  %-12s  %-8s  %s\n",
+                "─────────", "───────", "────────────", "────────────",
+                "────────────", "────────", "───────");
+
+    const int step = std::max(1, (nK - 2) / 18);
+    for (int i = 1; i < nK - 1; i += step) {
+        const double Ki   = K_arr[i];
+        const double xi   = std::log(S / Ki);          // ln(S/K); sign convention matches codebase
+        const double xret = -xi;                        // log-return to reach Ki: ln(Ki/S)
+        const double kg   = Ki * bs_density(S, Ki, T, r, sigma);   // x-space Gaussian
+        const double kc   = cauchy_propagator(xret, T, gamma_C);   // x-space Cauchy (symmetric)
+        const double kr   = q_rbs_x[i];
+        const double rat  = (kg > 1e-12) ? kc / kg : 0.0;
+        const bool   in   = (std::abs(xi) <= cone_x);
+        std::printf("  %+9.4f  %7.2f  %-12.6f  %-12.6f  %-12.6f  %-8.4f  %s\n",
+                    xi, Ki, kg, kc, kr, rat, in ? "inside" : "OUTSIDE");
+    }
+
+    // ── Part 2: Cauchy digital vs BS digital ──────────────────────────────────
+    std::printf("\n  Part 2: P(S_T > K) — Cauchy digital vs BS digital call probability\n");
+    std::printf("  At moderate OTM: Cauchy < BS (broader peak, less modal probability).\n");
+    std::printf("  At extreme  OTM: Cauchy >> BS (polynomial tail dominates Gaussian).\n\n");
+
+    std::printf("  %-7s  %-9s  %-10s  %-9s  %-10s  %-9s  %s\n",
+                "K", "d₂", "N(d₂) BS", "d_C", "CDF_C", "C/BS", "note");
+    std::printf("  %-7s  %-9s  %-10s  %-9s  %-10s  %-9s  %s\n",
+                "───────", "─────────", "──────────", "─────────",
+                "──────────", "─────────", "────────────");
+
+    for (double K : {70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 150.0, 180.0}) {
+        const double d2    = (std::log(S / K) + (r - 0.5*sigma*sigma)*T) / (sigma*sqrtT);
+        const double nd2   = norm_cdf(d2);
+        const double d_C   = std::log(S / K) / (gamma_C * T);
+        const double cdf_c = cauchy_cdf(d_C);
+        const double ratio = (nd2 > 1e-12) ? cdf_c / nd2 : 0.0;
+        const char*  note  = (std::abs(std::log(S / K)) > cone_x) ? "OTM>cone*" : "";
+        std::printf("  %-7.1f  %+9.4f  %-10.6f  %+9.4f  %-10.6f  %-9.4f  %s\n",
+                    K, d2, nd2, d_C, cdf_c, ratio, note);
+    }
+    std::printf("  (* OTM>cone: outside RBS light cone — K_RBS≈0, K_Cauchy>0)\n");
+
+    // ── Part 3: Density mixing at the cone boundary ───────────────────────────
+    const double x_pr    = 1.05 * cone_x;   // just outside the cone
+    const double kc_pr   = cauchy_propagator(x_pr, T, gamma_C);  // symmetric
+
+    // Interpolate K_RBS at the two cone-edge probe points from the precomputed array
+    auto rbs_at_K = [&](double Ktgt) -> double {
+        double f = (Ktgt - K_lo) / dK;
+        int i0   = std::clamp(static_cast<int>(f), 1, nK - 3);
+        double t = f - i0;
+        return q_rbs_x[i0] * (1.0 - t) + q_rbs_x[i0 + 1] * t;
+    };
+
+    const double K_itm = S * std::exp(-x_pr);   // x = +x_pr (ITM call)
+    const double K_otm = S * std::exp( x_pr);   // x = −x_pr (OTM call)
+    const double kg_itm = K_itm * bs_density(S, K_itm, T, r, sigma);
+    const double kg_otm = K_otm * bs_density(S, K_otm, T, r, sigma);
+    const double kr_itm = rbs_at_K(K_itm);
+    const double kr_otm = rbs_at_K(K_otm);
+
+    std::printf("\n  Part 3: Density mixing at 1.05× cone boundary  (x = ±%.4f)\n", x_pr);
+    std::printf("  K_mix(ρ) = (1−ρ)·K_RBS + ρ·K_Cauchy\n");
+    std::printf("  At ρ=0: hard causal cutoff (K_RBS≈0). At ρ>0: Cauchy restores tail density.\n\n");
+
+    for (int wing = 0; wing < 2; ++wing) {
+        double Kw = (wing == 0) ? K_itm : K_otm;
+        double kgw = (wing == 0) ? kg_itm : kg_otm;
+        double krw = (wing == 0) ? kr_itm : kr_otm;
+        double xw  = (wing == 0) ? x_pr   : -x_pr;
+        std::printf("  x=%+.4f  K=%.2f  (%s):\n", xw, Kw,
+                    wing == 0 ? "ITM call wing" : "OTM call wing");
+        std::printf("  %-6s  %-12s  %-12s  %-12s  %-12s\n",
+                    "ρ", "K_Gaussian", "K_Cauchy", "K_RBS", "K_mix");
+        std::printf("  %-6s  %-12s  %-12s  %-12s  %-12s\n",
+                    "──────", "────────────", "────────────", "────────────", "────────────");
+        for (double rho : {0.0, 0.10, 0.30, 0.50}) {
+            double kmix = (1.0 - rho) * krw + rho * kc_pr;
+            std::printf("  %-6.2f  %-12.6f  %-12.6f  %-12.6f  %-12.6f\n",
+                        rho, kgw, kc_pr, krw, kmix);
+        }
+        std::printf("\n");
+    }
+    std::printf("  K_Cauchy at cone edge = %.4f  (vs K_RBS_ITM=%.4f  K_RBS_OTM=%.4f)\n"
+                "  10%% Cauchy mixing adds %.4f to the mixed density at the boundary.\n"
+                "  (Exact K_RBS=0 is visible ~1.3× outside the cone — see Part 1.)\n",
+                kc_pr, kr_itm, kr_otm, 0.10 * kc_pr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Main
 // ─────────────────────────────────────────────────────────────────────────────
 int main() {
@@ -1300,6 +1491,7 @@ int main() {
     print_iv_frown(S, T, r, sigma);
     print_kg_table(S, T, r, sigma, 0.10);
     print_light_cone(S, T, r, sigma, 0.10);
+    print_cauchy_table(S, T, r, sigma, 0.10);
     run_convergence(S, K, T, r, sigma);
     run_benchmark(sigma, r, T, K);
 
