@@ -1,0 +1,8 @@
+rel_bs.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+a.out

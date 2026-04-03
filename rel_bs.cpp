@@ -430,7 +430,8 @@ struct TridiagSolver {
 // ─────────────────────────────────────────────────────────────────────────────
 static std::vector<double>
 solve_cn(double sigma, double r, double T, double K,
-         int Nt, bool is_call, const Grid& g, double m_sq = 0.0) {
+         int Nt, bool is_call, const Grid& g, double m_sq = 0.0,
+         bool is_american = false) {
     const double dtau = T / Nt;
     const double inv_dt = 1.0 / dtau;
     const Stencil st = Stencil::make(sigma, r, g.dx, m_sq);
@@ -468,6 +469,14 @@ solve_cn(double sigma, double r, double T, double K,
         rhs[g.Nx - 1]   += 0.5 * st.C * br_n1;
 
         solver.solve(rhs, V_next);
+        if (is_american) {
+            for (int i = 0; i < g.Nx; ++i) {
+                const double xi   = g.at(i);
+                const double intr = is_call ? K * std::max(std::exp(xi) - 1.0, 0.0)
+                                            : K * std::max(1.0 - std::exp(xi), 0.0);
+                if (V_next[i] < intr) V_next[i] = intr;
+            }
+        }
         std::swap(V, V_next);
     }
     return V;
@@ -493,9 +502,10 @@ static constexpr double TAU_REL_MIN = 1e-12;  // use CN below this threshold
 
 static std::vector<double>
 solve_rbs(double sigma, double r, double T, double K, double tau_rel,
-          int Nt, bool is_call, const Grid& g, double m_sq = 0.0) {
+          int Nt, bool is_call, const Grid& g, double m_sq = 0.0,
+          bool is_american = false) {
     if (tau_rel < TAU_REL_MIN)
-        return solve_cn(sigma, r, T, K, Nt, is_call, g, m_sq);
+        return solve_cn(sigma, r, T, K, Nt, is_call, g, m_sq, is_american);
 
     const double dtau  = T / Nt;
     const double theta = 0.5;
@@ -558,6 +568,14 @@ solve_rbs(double sigma, double r, double T, double K, double tau_rel,
         rhs[g.Nx - 1]   += theta * st.C * br_next;
 
         solver.solve(rhs, V_next);
+        if (is_american) {
+            for (int i = 0; i < g.Nx; ++i) {
+                const double xi   = g.at(i);
+                const double intr = is_call ? K * std::max(std::exp(xi) - 1.0, 0.0)
+                                            : K * std::max(1.0 - std::exp(xi), 0.0);
+                if (V_next[i] < intr) V_next[i] = intr;
+            }
+        }
 
         // Shift time levels (pointer swap, no allocation)
         std::swap(V_prev, V_curr);
@@ -573,6 +591,117 @@ static std::vector<double>
 solve_kg(double sigma, double r, double T, double K, double tau_rel, double m_sq,
          int Nt, bool is_call, const Grid& g) {
     return solve_rbs(sigma, r, T, K, tau_rel, Nt, is_call, g, m_sq);
+}
+
+// American option: projected penalty at each time step (early exercise constraint).
+// For a non-dividend-paying stock, American call = European call; American put > European put.
+static std::vector<double>
+solve_rbs_american(double sigma, double r, double T, double K, double tau_rel,
+                   int Nt, bool is_call, const Grid& g) {
+    return solve_rbs(sigma, r, T, K, tau_rel, Nt, is_call, g, 0.0, true);
+}
+
+// Down-and-out barrier: zero the option value at all grid nodes below the log-barrier
+// x_b = ln(H/K) at each time step.  For a call H < S (barrier below spot); for a put
+// the barrier is typically also below spot.  When H → 0 (x_b → −∞) the barrier has
+// no effect and the price recovers the vanilla value.
+static std::vector<double>
+solve_rbs_barrier(double sigma, double r, double T, double K, double tau_rel,
+                  double H, int Nt, bool is_call, const Grid& g) {
+    // Reuse solve_rbs with is_american=false, then apply barrier knock-out post-solve.
+    // We need access to the time loop — so we re-implement the barrier projection
+    // by wrapping: re-solve with is_american=false and apply barrier separately here
+    // via a thin lambda over the existing solver.  Since solve_rbs returns only the
+    // final grid, we instead inline the knock-out into a copy of the solver logic.
+    // For simplicity: barrier is applied as a spatial mask — nodes with x < x_b are
+    // zeroed after each Thomas solve (equivalent to absorbing boundary condition).
+
+    if (tau_rel < TAU_REL_MIN) {
+        // CN path with barrier zeroing
+        const double dtau  = T / Nt;
+        const double inv_dt = 1.0 / dtau;
+        const Stencil st = Stencil::make(sigma, r, g.dx);
+
+        std::vector<double> lo  (g.Nx, -0.5 * st.A);
+        std::vector<double> diag(g.Nx,  inv_dt - 0.5 * st.B);
+        std::vector<double> up  (g.Nx, -0.5 * st.C);
+        TridiagSolver solver;
+        solver.factor(lo, diag, up);
+
+        std::vector<double> V(g.Nx), V_next(g.Nx), LV(g.Nx), rhs(g.Nx);
+        const double x_b = std::log(H / K);
+        for (int i = 0; i < g.Nx; ++i) {
+            const double xi = g.at(i);
+            V[i] = (xi < x_b) ? 0.0
+                   : (is_call ? K * std::max(std::exp(xi) - 1.0, 0.0)
+                               : K * std::max(1.0 - std::exp(xi), 0.0));
+        }
+        for (int n = 0; n < Nt; ++n) {
+            auto [bl_n, br_n]   = get_bcs(g, K, r, n       * dtau, is_call);
+            auto [bl_n1, br_n1] = get_bcs(g, K, r, (n + 1) * dtau, is_call);
+            apply_L(V, st, bl_n, br_n, LV);
+            for (int i = 0; i < g.Nx; ++i) rhs[i] = inv_dt * V[i] + 0.5 * LV[i];
+            rhs[0]        += 0.5 * st.A * bl_n1;
+            rhs[g.Nx - 1] += 0.5 * st.C * br_n1;
+            solver.solve(rhs, V_next);
+            for (int i = 0; i < g.Nx; ++i)
+                if (g.at(i) < x_b) V_next[i] = 0.0;
+            std::swap(V, V_next);
+        }
+        return V;
+    }
+
+    // 3-level RBS path with barrier zeroing
+    const double dtau  = T / Nt;
+    const double theta = 0.5;
+    const Stencil st   = Stencil::make(sigma, r, g.dx);
+    const double A_c   = tau_rel / (dtau * dtau);
+    const double B_c   = 1.0 / (2.0 * dtau);
+    const double alpha = A_c + B_c;
+    const double beta2 = 2.0 * A_c;
+    const double gamma = -A_c + B_c;
+
+    std::vector<double> lo  (g.Nx, -theta * st.A);
+    std::vector<double> diag(g.Nx,  alpha - theta * st.B);
+    std::vector<double> up  (g.Nx, -theta * st.C);
+    TridiagSolver solver;
+    solver.factor(lo, diag, up);
+
+    std::vector<double> V_prev(g.Nx), V_curr(g.Nx), V_next(g.Nx);
+    std::vector<double> LV_prev(g.Nx), rhs(g.Nx);
+    const double x_b = std::log(H / K);
+
+    auto apply_barrier = [&](std::vector<double>& V) {
+        for (int i = 0; i < g.Nx; ++i)
+            if (g.at(i) < x_b) V[i] = 0.0;
+    };
+
+    for (int i = 0; i < g.Nx; ++i) {
+        const double xi = g.at(i);
+        V_prev[i] = (xi < x_b) ? 0.0
+                    : (is_call ? K * std::max(std::exp(xi) - 1.0, 0.0)
+                                : K * std::max(1.0 - std::exp(xi), 0.0));
+    }
+    for (int i = 0; i < g.Nx; ++i)
+        V_curr[i] = (g.at(i) < x_b) ? 0.0 : bs_at_x(g.at(i), K, dtau, r, sigma, is_call);
+    apply_barrier(V_curr);
+
+    for (int n = 1; n < Nt; ++n) {
+        const double tau_prev = (n - 1) * dtau;
+        const double tau_next = (n + 1) * dtau;
+        auto [bl_prev, br_prev] = get_bcs(g, K, r, tau_prev, is_call);
+        auto [bl_next, br_next] = get_bcs(g, K, r, tau_next, is_call);
+        apply_L(V_prev, st, bl_prev, br_prev, LV_prev);
+        for (int i = 0; i < g.Nx; ++i)
+            rhs[i] = beta2 * V_curr[i] + gamma * V_prev[i] + theta * LV_prev[i];
+        rhs[0]        += theta * st.A * bl_next;
+        rhs[g.Nx - 1] += theta * st.C * br_next;
+        solver.solve(rhs, V_next);
+        apply_barrier(V_next);
+        std::swap(V_prev, V_curr);
+        std::swap(V_curr, V_next);
+    }
+    return V_curr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -624,6 +753,64 @@ static GreeksResult compute_greeks(
                           / (2.0 * eps_v);
 
     return { price, delta, gamma, vega };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Greeks surface table: Δ and Γ across K × τ_rel
+//
+//  Shows how early-exercise sensitivity changes with moneyness and relativistic
+//  relaxation time.  Δ → 0 (deep OTM) or 1 (deep ITM); Γ peaks at-the-money.
+// ─────────────────────────────────────────────────────────────────────────────
+static void print_greeks_surface(double S, double T, double r, double sigma,
+                                 int Nx = 400, int Nt = 600) {
+    const double strikes[]  = {70, 80, 90, 100, 110, 120, 130};
+    const double tau_rels[] = {0.0, 1e-3, 1e-2, 5e-2, 1e-1};
+
+    std::printf("\n");
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("   Greeks Surface: Δ and Γ (call)  [S=%.0f  T=%.2fyr  r=%.0f%%  σ=%.0f%%]\n",
+                S, T, r*100, sigma*100);
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+
+    // Header
+    std::printf("\n  ── Delta (Δ = ∂C/∂S) ─────────────────────────────────────────────────────\n");
+    std::printf("  %-6s", "K \\ τ");
+    for (double tr : tau_rels)
+        std::printf("  %10s", tr == 0.0 ? "BS(τ→0)" : (tr < 1e-2 ? "1e-3" : tr < 5e-2 ? "1e-2" : tr < 0.09 ? "5e-2" : "1e-1"));
+    std::printf("\n  %-6s", "──────");
+    for (size_t j = 0; j < 5; ++j) std::printf("  %10s", "──────────");
+    std::printf("\n");
+
+    for (double Kk : strikes) {
+        Grid g = Grid::make(sigma, T, Nx, 6.5);
+        std::printf("  %-6.0f", Kk);
+        for (double tr : tau_rels) {
+            const double tau_eff = (tr == 0.0) ? 1e-15 : tr;
+            GreeksResult gr = compute_greeks(S, Kk, T, r, sigma, tau_eff, Nt, true, g);
+            std::printf("  %10.5f", gr.delta);
+        }
+        std::printf("\n");
+    }
+
+    std::printf("\n  ── Gamma (Γ = ∂²C/∂S²) ──────────────────────────────────────────────────\n");
+    std::printf("  %-6s", "K \\ τ");
+    for (double tr : tau_rels)
+        std::printf("  %10s", tr == 0.0 ? "BS(τ→0)" : (tr < 1e-2 ? "1e-3" : tr < 5e-2 ? "1e-2" : tr < 0.09 ? "5e-2" : "1e-1"));
+    std::printf("\n  %-6s", "──────");
+    for (size_t j = 0; j < 5; ++j) std::printf("  %10s", "──────────");
+    std::printf("\n");
+
+    for (double Kk : strikes) {
+        Grid g = Grid::make(sigma, T, Nx, 6.5);
+        std::printf("  %-6.0f", Kk);
+        for (double tr : tau_rels) {
+            const double tau_eff = (tr == 0.0) ? 1e-15 : tr;
+            GreeksResult gr = compute_greeks(S, Kk, T, r, sigma, tau_eff, Nt, true, g);
+            std::printf("  %10.6f", gr.gamma);
+        }
+        std::printf("\n");
+    }
+    std::printf("\n");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -841,8 +1028,73 @@ static void run_tests(double S = 100, double K = 100, double T = 1.0,
         fail += !pass;
     }
 
+    // Test 13: American put ≥ European put (early exercise has value)
+    //   For a dividend-free stock, American put price must be ≥ European put.
+    {
+        const double tr   = 0.05;
+        Grid g13 = Grid::make(sigma, T, 400, 6.5);
+        const double x0  = std::log(S / K);
+        const double V_eu = grid_interp(solve_rbs(sigma, r, T, K, tr, 400, false, g13),
+                                        g13, x0);
+        const double V_am = grid_interp(solve_rbs_american(sigma, r, T, K, tr, 400, false, g13),
+                                        g13, x0);
+        bool pass = (V_am >= V_eu - 1e-10);
+        std::printf("  [%s] American put >= European put:                  "
+                    "Am=%.5f  Eu=%.5f  diff=%.2e\n",
+                    pass ? "PASS" : "FAIL", V_am, V_eu, V_am - V_eu);
+        fail += !pass;
+    }
+
+    // Test 14: American call ≈ European call (no dividends → no early exercise value)
+    //   For non-dividend-paying stock, American call = European call (Merton theorem).
+    {
+        const double tr   = 0.05;
+        Grid g14 = Grid::make(sigma, T, 400, 6.5);
+        const double x0  = std::log(S / K);
+        const double V_eu = grid_interp(solve_rbs(sigma, r, T, K, tr, 400, true, g14),
+                                        g14, x0);
+        const double V_am = grid_interp(solve_rbs_american(sigma, r, T, K, tr, 400, true, g14),
+                                        g14, x0);
+        bool pass = (std::fabs(V_am - V_eu) < 1e-6);
+        std::printf("  [%s] American call == European call (no dividends): "
+                    "Am=%.5f  Eu=%.5f  diff=%.2e\n",
+                    pass ? "PASS" : "FAIL", V_am, V_eu, V_am - V_eu);
+        fail += !pass;
+    }
+
+    // Test 15: Down-and-out barrier call ≤ vanilla call (barrier removes scenarios)
+    {
+        const double tr  = 0.05;
+        const double H   = 85.0;    // barrier below spot (down-and-out)
+        Grid g15 = Grid::make(sigma, T, 400, 6.5);
+        const double x0  = std::log(S / K);
+        const double V_van = grid_interp(solve_rbs(sigma, r, T, K, tr, 400, true, g15), g15, x0);
+        const double V_bar = grid_interp(solve_rbs_barrier(sigma, r, T, K, tr, H, 400, true, g15), g15, x0);
+        bool pass = (V_bar <= V_van + 1e-10);
+        std::printf("  [%s] Barrier call <= Vanilla call:                  "
+                    "Bar=%.5f  Van=%.5f  diff=%.2e\n",
+                    pass ? "PASS" : "FAIL", V_bar, V_van, V_bar - V_van);
+        fail += !pass;
+    }
+
+    // Test 16: Barrier at H=0 (effectively) recovers vanilla price
+    //   Use H very small so x_b = ln(H/K) << x_min → barrier never triggers.
+    {
+        const double tr  = 0.05;
+        const double H   = 0.01;    // barrier far below grid
+        Grid g16 = Grid::make(sigma, T, 400, 6.5);
+        const double x0  = std::log(S / K);
+        const double V_van = grid_interp(solve_rbs(sigma, r, T, K, tr, 400, true, g16), g16, x0);
+        const double V_bar = grid_interp(solve_rbs_barrier(sigma, r, T, K, tr, H, 400, true, g16), g16, x0);
+        bool pass = (std::fabs(V_bar - V_van) < 1e-8);
+        std::printf("  [%s] Barrier(H→0) == Vanilla:                      "
+                    "Bar=%.5f  Van=%.5f  diff=%.2e\n",
+                    pass ? "PASS" : "FAIL", V_bar, V_van, V_bar - V_van);
+        fail += !pass;
+    }
+
     std::printf("  ─────────────────────────────────────────────────────\n");
-    std::printf("  %d/%d tests passed\n\n", 12 - fail, 12);
+    std::printf("  %d/%d tests passed\n\n", 16 - fail, 16);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1054,6 +1306,258 @@ static void print_iv_frown(double S, double T, double r, double sigma, int Nt = 
     for (int ti = 0; ti < nT; ++ti) {
         bool is_frown = (ivs[4][ti] > ivs[0][ti]) && (ivs[4][ti] > ivs[8][ti]);
         std::printf("  %8s", is_frown ? "FROWN" : "partial");
+    }
+    std::printf("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ASCII IV smile plot
+//
+//  Horizontal bar chart of implied volatility vs strike for each τ_rel.
+//  Bar length encodes IV in percent.  ATM is marked with ←ATM.
+//  The RBS frown (ATM IV > wings) is visible as bars shorter at the extremes.
+// ─────────────────────────────────────────────────────────────────────────────
+static void print_ascii_iv_smile(double S, double T, double r, double sigma,
+                                 int Nt = 800) {
+    const std::vector<double> strikes  = {70, 80, 90, 95, 100, 105, 110, 120, 130};
+    const std::vector<double> tau_rels = {1e-3, 1e-2, 0.10};
+    const int nK = static_cast<int>(strikes.size());
+    const int nT = static_cast<int>(tau_rels.size());
+    const int BAR_WIDTH = 40;  // characters for max IV
+
+    std::printf("\n");
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("   ASCII IV Smile  [S=%.0f  T=%.2fyr  r=%.0f%%  σ_input=%.0f%%]\n",
+                S, T, r*100, sigma*100);
+    std::printf("   Each bar = IV(%%).  Reference: BS flat = %.1f%% (shown as |)\n", sigma*100);
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+
+    // Compute IVs
+    std::vector<std::vector<double>> ivs(nK, std::vector<double>(nT, 0.0));
+    double iv_max = sigma * 1.05;
+    for (int ki = 0; ki < nK; ++ki) {
+        const double K  = strikes[ki];
+        const double x0 = std::log(S / K);
+        Grid g = Grid::make(sigma, T, 600, 6.5);
+        for (int ti = 0; ti < nT; ++ti) {
+            double V = grid_interp(solve_rbs(sigma, r, T, K, tau_rels[ti], Nt, true, g), g, x0);
+            ivs[ki][ti] = implied_vol(V, S, K, T, r, true);
+            if (ivs[ki][ti] > iv_max) iv_max = ivs[ki][ti];
+        }
+    }
+
+    const char* tau_labels[] = {"τ=1e-3", "τ=1e-2", "τ=0.10"};
+    for (int ti = 0; ti < nT; ++ti) {
+        std::printf("\n  ── %s ──────────────────────────────────────────────────────────\n",
+                    tau_labels[ti]);
+        std::printf("  %-5s  %-6s  %s\n", "K", "IV(%)", "");
+        // mark where BS reference falls
+        const int bs_bar = static_cast<int>(sigma * 100.0 / (iv_max * 100.0) * BAR_WIDTH);
+        for (int ki = 0; ki < nK; ++ki) {
+            const double iv_pct = ivs[ki][ti] * 100.0;
+            const int bar_len   = static_cast<int>(iv_pct / (iv_max * 100.0) * BAR_WIDTH);
+            const bool is_atm   = (strikes[ki] == 100.0);
+            std::printf("  %-5.0f  %5.2f%%  |", strikes[ki], iv_pct);
+            for (int b = 0; b < BAR_WIDTH; ++b) {
+                if (b < bar_len)       std::printf("█");
+                else if (b == bs_bar)  std::printf("|");
+                else                   std::printf(" ");
+            }
+            std::printf("%s\n", is_atm ? " ←ATM" : "");
+        }
+    }
+    std::printf("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Calibration: fit τ_rel to an observed IV surface via golden-section search
+//
+//  Objective: minimize sum_i (IV_RBS(K_i, τ_rel) − IV_obs_i)²
+//  τ_rel is the single free parameter; σ is the ATM flat vol (input).
+//
+//  Uses golden-section search (bracket [τ_lo, τ_hi]) — no derivatives needed.
+//  Suitable for a single-parameter surface fit.  Extend to (τ_rel, σ) 2-D
+//  calibration by adding an outer Newton loop on σ.
+// ─────────────────────────────────────────────────────────────────────────────
+struct CalibResult {
+    double tau_rel;   // calibrated relaxation time
+    double rmse;      // root-mean-squared IV error (vol points)
+};
+
+static CalibResult calibrate_tau_rel(
+        double S, double T, double r, double sigma,
+        const std::vector<double>& strikes,
+        const std::vector<double>& iv_obs,   // observed IVs in decimal (e.g. 0.20)
+        double tau_lo = 1e-5, double tau_hi = 0.5,
+        double tol = 1e-7, int max_iter = 80) {
+
+    const int nK = static_cast<int>(strikes.size());
+    Grid g = Grid::make(sigma, T, 600, 6.5);
+
+    // Compute RMSE for a given τ_rel
+    auto rmse_fn = [&](double tr) -> double {
+        double sse = 0.0;
+        for (int ki = 0; ki < nK; ++ki) {
+            const double K  = strikes[ki];
+            const double x0 = std::log(S / K);
+            double V = grid_interp(solve_rbs(sigma, r, T, K, tr, 600, true, g), g, x0);
+            double iv = implied_vol(V, S, K, T, r, true);
+            double diff = iv - iv_obs[ki];
+            sse += diff * diff;
+        }
+        return std::sqrt(sse / nK);
+    };
+
+    // Golden-section search
+    const double phi = 0.6180339887498949;  // (√5−1)/2
+    double a = tau_lo, b = tau_hi;
+    double c = b - phi * (b - a);
+    double d = a + phi * (b - a);
+    double fc = rmse_fn(c), fd = rmse_fn(d);
+
+    for (int iter = 0; iter < max_iter && (b - a) > tol; ++iter) {
+        if (fc < fd) {
+            b = d; d = c; fd = fc;
+            c = b - phi * (b - a); fc = rmse_fn(c);
+        } else {
+            a = c; c = d; fc = fd;
+            d = a + phi * (b - a); fd = rmse_fn(d);
+        }
+    }
+    const double tau_best = 0.5 * (a + b);
+    return { tau_best, rmse_fn(tau_best) };
+}
+
+// Print calibration demo: synthesize a "market" IV surface from a known τ_rel,
+// then recover it via calibration.  Shows the round-trip error.
+static void print_calibration_demo(double S, double T, double r, double sigma) {
+    const std::vector<double> strikes = {80, 90, 95, 100, 105, 110, 120};
+    const double tau_true = 0.05;   // "true" market τ_rel
+
+    std::printf("\n");
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("   Calibration Demo: recover τ_rel from synthetic IV surface\n");
+    std::printf("   True τ_rel = %.4f  |  S=%.0f  T=%.2fyr  r=%.0f%%  σ=%.0f%%\n",
+                tau_true, S, T, r*100, sigma*100);
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+
+    // Synthesize observed IVs from the "true" τ_rel
+    Grid g = Grid::make(sigma, T, 600, 6.5);
+    std::vector<double> iv_obs;
+    std::printf("\n  Synthetic market IVs (from τ_rel=%.4f):\n", tau_true);
+    std::printf("  %-6s  %-10s\n", "K", "IV_obs(%)");
+    std::printf("  %-6s  %-10s\n", "──────", "──────────");
+    for (double K : strikes) {
+        const double x0 = std::log(S / K);
+        double V  = grid_interp(solve_rbs(sigma, r, T, K, tau_true, 600, true, g), g, x0);
+        double iv = implied_vol(V, S, K, T, r, true);
+        iv_obs.push_back(iv);
+        std::printf("  %-6.0f  %9.4f%%\n", K, iv * 100.0);
+    }
+
+    // Calibrate
+    auto res = calibrate_tau_rel(S, T, r, sigma, strikes, iv_obs);
+
+    std::printf("\n  Calibration result:\n");
+    std::printf("    τ_rel (true)      = %.6f\n", tau_true);
+    std::printf("    τ_rel (calibrated)= %.6f\n", res.tau_rel);
+    std::printf("    Recovery error    = %.2e\n",  std::fabs(res.tau_rel - tau_true));
+    std::printf("    RMSE (IV, bp)     = %.4f\n",  res.rmse * 10000.0);
+    std::printf("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  American option table
+//
+//  Early exercise premium = American − European.
+//  For puts: premium grows with ITM-ness and r (opportunity cost of holding intrinsic value).
+//  For calls (no dividends): premium = 0 by Merton theorem.
+//
+//  Numerical method: projected penalty — after each Thomas solve, clamp V ≥ intrinsic.
+//  This is equivalent to a free-boundary problem and converges under the implicit scheme.
+// ─────────────────────────────────────────────────────────────────────────────
+static void print_american_table(double S, double T, double r, double sigma,
+                                 double tau_rel, int Nx = 600, int Nt = 800) {
+    Grid g = Grid::make(sigma, T, Nx, 6.5);
+    const double strikes[] = {70, 80, 90, 100, 110, 120, 130};
+
+    std::printf("\n");
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("   American vs European Option Prices  (RBS early-exercise premium)\n");
+    std::printf("   S=%.1f  T=%.2f yr  r=%.2f%%  σ=%.1f%%  τ_rel=%.4f  Nx=%d  Nt=%d\n",
+                S, T, r*100, sigma*100, tau_rel, Nx, Nt);
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+
+    // PUT TABLE
+    std::printf("\n  ── Puts ──────────────────────────────────────────────────────────────────\n");
+    std::printf("  %-6s  %-12s  %-12s  %-12s  %-8s\n",
+                "K", "European", "American", "Premium", "Premium%");
+    std::printf("  %-6s  %-12s  %-12s  %-12s  %-8s\n",
+                "──────", "────────────", "────────────", "────────────", "────────");
+    for (double Kk : strikes) {
+        const double x0  = std::log(S / Kk);
+        auto Veu = solve_rbs(sigma, r, T, Kk, tau_rel, Nt, false, g);
+        auto Vam = solve_rbs_american(sigma, r, T, Kk, tau_rel, Nt, false, g);
+        const double eu  = grid_interp(Veu, g, x0);
+        const double am  = grid_interp(Vam, g, x0);
+        const double prem = am - eu;
+        const double pct  = eu > 1e-8 ? 100.0 * prem / eu : 0.0;
+        std::printf("  %-6.0f  %-12.5f  %-12.5f  %-12.5f  %+7.2f%%\n",
+                    Kk, eu, am, prem, pct);
+    }
+
+    // CALL TABLE
+    std::printf("\n  ── Calls (no dividends → American = European by Merton) ─────────────────\n");
+    std::printf("  %-6s  %-12s  %-12s  %-12s  %-8s\n",
+                "K", "European", "American", "Premium", "Premium%");
+    std::printf("  %-6s  %-12s  %-12s  %-12s  %-8s\n",
+                "──────", "────────────", "────────────", "────────────", "────────");
+    for (double Kk : strikes) {
+        const double x0  = std::log(S / Kk);
+        auto Veu = solve_rbs(sigma, r, T, Kk, tau_rel, Nt, true, g);
+        auto Vam = solve_rbs_american(sigma, r, T, Kk, tau_rel, Nt, true, g);
+        const double eu  = grid_interp(Veu, g, x0);
+        const double am  = grid_interp(Vam, g, x0);
+        const double prem = am - eu;
+        std::printf("  %-6.0f  %-12.5f  %-12.5f  %-12.2e  %s\n",
+                    Kk, eu, am, prem, std::fabs(prem) < 1e-4 ? "(Merton ✓)" : "(nonzero!)");
+    }
+    std::printf("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Barrier option table (down-and-out)
+//
+//  Barrier discount = vanilla − barrier price.
+//  As H rises toward S, the barrier becomes binding and the price drops to 0.
+//  As H → 0, barrier price → vanilla price (barrier below grid, never triggered).
+// ─────────────────────────────────────────────────────────────────────────────
+static void print_barrier_table(double S, double T, double r, double sigma,
+                                double tau_rel, int Nx = 600, int Nt = 800) {
+    Grid g = Grid::make(sigma, T, Nx, 6.5);
+    const double K = S;   // ATM
+
+    std::printf("\n");
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("   Down-and-Out Barrier Call  (RBS)  vs  Vanilla\n");
+    std::printf("   S=%.1f  K=%.1f  T=%.2f yr  r=%.2f%%  σ=%.1f%%  τ_rel=%.4f\n",
+                S, K, T, r*100, sigma*100, tau_rel);
+    std::printf("  ══════════════════════════════════════════════════════════════════════════\n");
+    std::printf("  %-8s  %-12s  %-12s  %-12s  %-8s\n",
+                "Barrier H", "Vanilla", "Barrier", "Discount", "Disc%");
+    std::printf("  %-8s  %-12s  %-12s  %-12s  %-8s\n",
+                "────────", "────────────", "────────────", "────────────", "────────");
+
+    const double x0      = std::log(S / K);  // = 0 for ATM
+    const double V_van   = grid_interp(solve_rbs(sigma, r, T, K, tau_rel, Nt, true, g), g, x0);
+
+    for (double H : {50.0, 60.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0}) {
+        const double V_bar  = grid_interp(
+            solve_rbs_barrier(sigma, r, T, K, tau_rel, H, Nt, true, g), g, x0);
+        const double disc   = V_van - V_bar;
+        const double pct    = 100.0 * disc / V_van;
+        std::printf("  %-8.1f  %-12.5f  %-12.5f  %-12.5f  %+7.2f%%\n",
+                    H, V_van, V_bar, disc, pct);
     }
     std::printf("\n");
 }
@@ -1492,6 +1996,11 @@ int main() {
     print_kg_table(S, T, r, sigma, 0.10);
     print_light_cone(S, T, r, sigma, 0.10);
     print_cauchy_table(S, T, r, sigma, 0.10);
+    print_greeks_surface(S, T, r, sigma);
+    print_ascii_iv_smile(S, T, r, sigma);
+    print_calibration_demo(S, T, r, sigma);
+    print_american_table(S, T, r, sigma, 0.05);
+    print_barrier_table(S, T, r, sigma, 0.05);
     run_convergence(S, K, T, r, sigma);
     run_benchmark(sigma, r, T, K);
 
