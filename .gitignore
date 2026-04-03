@@ -6,3 +6,6 @@ rel_bs.exe
 *.exp
 *.lib
 a.out
+venv/
+__pycache__/
+*.pyc
