@@ -1985,8 +1985,175 @@ static void print_cauchy_table(double S, double T, double r, double sigma,
 // ─────────────────────────────────────────────────────────────────────────────
 //  Main
 // ─────────────────────────────────────────────────────────────────────────────
-int main() {
+// ─────────────────────────────────────────────────────────────────────────────
+//  CSV output modes  (invoked by Python visualiser via --csv <mode>)
+//
+//  Each function writes a header line then data rows to stdout.
+//  Python calls:  ./rel_bs --csv <mode>  and reads via csv.reader / pandas.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// --csv iv_surface
+// Columns: K,tau_rel,iv_pct
+static void csv_iv_surface(double S, double T, double r, double sigma) {
+    const std::vector<double> strikes  = {70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130};
+    const std::vector<double> tau_rels = {1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 2e-2, 5e-2, 0.10, 0.15, 0.20};
+    std::printf("K,tau_rel,iv_pct\n");
+    for (double K : strikes) {
+        const double x0 = std::log(S / K);
+        Grid g = Grid::make(sigma, T, 600, 6.5);
+        for (double tr : tau_rels) {
+            double V  = grid_interp(solve_rbs(sigma, r, T, K, tr, 800, true, g), g, x0);
+            double iv = implied_vol(V, S, K, T, r, true);
+            std::printf("%.1f,%.6e,%.6f\n", K, tr, iv * 100.0);
+        }
+    }
+}
+
+// --csv density
+// Columns: x,K,k_rbs,k_gauss,k_cauchy,inside_cone
+static void csv_density(double S, double T, double r, double sigma, double tau_rel = 0.10) {
+    const double gamma_C = sigma;
+    const double c_light = sigma / std::sqrt(2.0 * tau_rel);
+    const double cone_x  = c_light * T;
+    const double ert     = std::exp(r * T);
+    const double x_range = 1.6 * cone_x;
+    const double K_lo    = S * std::exp(-x_range);
+    const double K_hi    = S * std::exp( x_range);
+    const int    nK      = 101;
+    const double dK      = (K_hi - K_lo) / (nK - 1);
+
+    Grid g = Grid::make(sigma, T, 600, 9.0);
+    std::vector<double> K_arr(nK), C_arr(nK), q_rbs_x(nK, 0.0);
+    for (int i = 0; i < nK; ++i) {
+        K_arr[i] = K_lo + i * dK;
+        C_arr[i] = grid_interp(solve_rbs(sigma, r, T, K_arr[i], tau_rel, 600, true, g),
+                               g, std::log(S / K_arr[i]));
+    }
+    for (int i = 1; i < nK - 1; ++i) {
+        double qK = std::max(0.0, ert * (C_arr[i-1] - 2.0*C_arr[i] + C_arr[i+1]) / (dK*dK));
+        q_rbs_x[i] = K_arr[i] * qK;
+    }
+
+    const double mu  = (r - 0.5 * sigma * sigma) * T;
+    const double sig = sigma * std::sqrt(T);
+
+    std::printf("x,K,k_rbs,k_gauss,k_cauchy,inside_cone\n");
+    for (int i = 1; i < nK - 1; ++i) {
+        double x    = std::log(K_arr[i] / S);
+        double kg   = std::exp(-0.5 * ((x - mu) / sig) * ((x - mu) / sig))
+                      / (sig * std::sqrt(2.0 * 3.14159265358979323846));
+        double kc   = cauchy_propagator(x, T, gamma_C);
+        int inside  = (std::fabs(x) <= cone_x) ? 1 : 0;
+        std::printf("%.6f,%.4f,%.8f,%.8f,%.8f,%d\n",
+                    x, K_arr[i], q_rbs_x[i], kg, kc, inside);
+    }
+}
+
+// --csv greeks
+// Columns: K,tau_rel,delta,gamma
+static void csv_greeks(double S, double T, double r, double sigma) {
+    const std::vector<double> strikes  = {70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130};
+    const std::vector<double> tau_rels = {1e-5, 1e-3, 5e-3, 1e-2, 5e-2, 0.10, 0.20};
+    std::printf("K,tau_rel,delta,gamma\n");
+    for (double K : strikes) {
+        Grid g = Grid::make(sigma, T, 400, 6.5);
+        for (double tr : tau_rels) {
+            GreeksResult gr = compute_greeks(S, K, T, r, sigma, tr, 600, true, g);
+            std::printf("%.1f,%.6e,%.8f,%.8f\n", K, tr, gr.delta, gr.gamma);
+        }
+    }
+}
+
+// --csv american
+// Columns: K,tau_rel,european_put,american_put,premium,premium_pct
+static void csv_american(double S, double T, double r, double sigma) {
+    const std::vector<double> strikes  = {70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130};
+    const std::vector<double> tau_rels = {1e-3, 1e-2, 5e-2, 0.10};
+    std::printf("K,tau_rel,european_put,american_put,premium,premium_pct\n");
+    for (double K : strikes) {
+        Grid g = Grid::make(sigma, T, 500, 6.5);
+        const double x0 = std::log(S / K);
+        for (double tr : tau_rels) {
+            double eu = grid_interp(solve_rbs(sigma, r, T, K, tr, 600, false, g), g, x0);
+            double am = grid_interp(solve_rbs_american(sigma, r, T, K, tr, 600, false, g), g, x0);
+            double pct = eu > 1e-8 ? 100.0 * (am - eu) / eu : 0.0;
+            std::printf("%.1f,%.6e,%.6f,%.6f,%.6f,%.4f\n", K, tr, eu, am, am - eu, pct);
+        }
+    }
+}
+
+// --csv barrier
+// Columns: H,tau_rel,vanilla,barrier_price,discount,discount_pct
+static void csv_barrier(double S, double T, double r, double sigma) {
+    const double K = S;
+    const double x0 = 0.0;
+    const std::vector<double> H_vals   = {50, 55, 60, 65, 70, 75, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98};
+    const std::vector<double> tau_rels = {1e-3, 1e-2, 5e-2, 0.10};
+    std::printf("H,tau_rel,vanilla,barrier_price,discount,discount_pct\n");
+    for (double tr : tau_rels) {
+        Grid g = Grid::make(sigma, T, 500, 6.5);
+        double van = grid_interp(solve_rbs(sigma, r, T, K, tr, 600, true, g), g, x0);
+        for (double H : H_vals) {
+            double bar = grid_interp(solve_rbs_barrier(sigma, r, T, K, tr, H, 600, true, g), g, x0);
+            double disc = van - bar;
+            double pct  = 100.0 * disc / van;
+            std::printf("%.1f,%.6e,%.6f,%.6f,%.6f,%.4f\n", H, tr, van, bar, disc, pct);
+        }
+    }
+}
+
+// --csv calibration
+// Columns: tau_rel,rmse_bp  (scans rmse landscape so Python can plot it)
+static void csv_calibration(double S, double T, double r, double sigma) {
+    // Synthesize "market" IV surface from tau_true=0.05
+    const double tau_true = 0.05;
+    const std::vector<double> strikes = {80, 90, 95, 100, 105, 110, 120};
+    Grid g = Grid::make(sigma, T, 600, 6.5);
+    std::vector<double> iv_obs;
+    for (double K : strikes) {
+        double V  = grid_interp(solve_rbs(sigma, r, T, K, tau_true, 600, true, g),
+                                g, std::log(S / K));
+        iv_obs.push_back(implied_vol(V, S, K, T, r, true));
+    }
+
+    // Scan RMSE landscape
+    const int N_scan = 120;
+    const double lo = 1e-5, hi = 0.35;
+    std::printf("tau_rel,rmse_bp\n");
+    for (int i = 0; i <= N_scan; ++i) {
+        double tr = lo * std::pow(hi / lo, static_cast<double>(i) / N_scan);
+        double sse = 0.0;
+        for (int ki = 0; ki < static_cast<int>(strikes.size()); ++ki) {
+            double V  = grid_interp(solve_rbs(sigma, r, T, strikes[ki], tr, 600, true, g),
+                                    g, std::log(S / strikes[ki]));
+            double iv = implied_vol(V, S, strikes[ki], T, r, true);
+            double diff = iv - iv_obs[ki];
+            sse += diff * diff;
+        }
+        double rmse_bp = std::sqrt(sse / strikes.size()) * 10000.0;
+        std::printf("%.8e,%.6f\n", tr, rmse_bp);
+    }
+}
+
+int main(int argc, char* argv[]) {
     const double S = 100.0, K = 100.0, T = 1.0, r = 0.05, sigma = 0.20;
+
+    // CSV mode: ./rel_bs --csv <mode>
+    if (argc >= 3 && std::string(argv[1]) == "--csv") {
+        std::string mode(argv[2]);
+        if      (mode == "iv_surface")  csv_iv_surface(S, T, r, sigma);
+        else if (mode == "density")     csv_density(S, T, r, sigma, 0.10);
+        else if (mode == "greeks")      csv_greeks(S, T, r, sigma);
+        else if (mode == "american")    csv_american(S, T, r, sigma);
+        else if (mode == "barrier")     csv_barrier(S, T, r, sigma);
+        else if (mode == "calibration") csv_calibration(S, T, r, sigma);
+        else {
+            std::fprintf(stderr, "Unknown CSV mode: %s\n", argv[2]);
+            std::fprintf(stderr, "Valid modes: iv_surface density greeks american barrier calibration\n");
+            return 1;
+        }
+        return 0;
+    }
 
     run_tests(S, K, T, r, sigma);
     print_table(S, K, T, r, sigma);
