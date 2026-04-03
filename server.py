@@ -1,21 +1,19 @@
 """
 server.py — FastAPI backend for the RBS Options Pricer dashboard.
 
-Wraps rel_bs.exe --csv <mode> and returns JSON:
-  { data: [...rows as dicts with float values], annotations: { title, body } }
+Wraps rel_bs.exe --csv <mode> and exposes two endpoint families:
+
+  GET /api/csv/{mode}   → flat JSON rows + annotations  (for 2D panels)
+  GET /api/grid/{mode}  → Plotly-ready x/y/z arrays + annotations (for 3D surfaces)
 
 Run with:
   uvicorn server:app --reload --port 8000
-
-Endpoints:
-  GET /                        health check
-  GET /api/meta                model parameters + available modes
-  GET /api/csv/{mode}          data + inference annotations
 """
 
 import io, csv, os, subprocess
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
 
 # ── locate executable ─────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +21,19 @@ EXE = os.path.join(SCRIPT_DIR, "rel_bs.exe")
 if not os.path.exists(EXE):
     EXE = os.path.join(SCRIPT_DIR, "rel_bs")
 
-VALID_MODES = ["iv_surface", "density", "greeks", "american", "barrier", "calibration"]
+VALID_MODES = [
+    "iv_surface", "density", "greeks", "american",
+    "barrier", "calibration", "comparison"
+]
+
+# Modes that expose a /api/grid endpoint (have two independent axes → surface)
+GRID_CONFIG = {
+    "iv_surface":  {"x": "K",   "y": "tau_rel", "z_cols": ["iv_pct"]},
+    "greeks":      {"x": "K",   "y": "tau_rel", "z_cols": ["delta", "gamma"]},
+    "american":    {"x": "K",   "y": "tau_rel", "z_cols": ["premium_pct"]},
+    "barrier":     {"x": "H",   "y": "tau_rel", "z_cols": ["discount_pct"]},
+    "comparison":  {"x": "K",   "y": "tau_rel", "z_cols": ["market_iv", "bs_iv", "rbs_iv"]},
+}
 
 # ── inference annotations ─────────────────────────────────────────────────────
 ANNOTATIONS = {
@@ -39,7 +49,7 @@ ANNOTATIONS = {
             "A calibrated τ_rel > 0.05 means the market is pricing significant speed-of-light "
             "constraints into option wings."
         ),
-        "key_insight": "Frown depth ∝ τ_rel — the further right you go on the heatmap, the deeper the smile inverts.",
+        "key_insight": "Frown depth grows with τ_rel — rotate the 3D surface to see the ATM ridge rising above the wings.",
     },
     "density": {
         "title": "Risk-Neutral Density — The Light Cone",
@@ -54,10 +64,9 @@ ANNOTATIONS = {
             "artifact. The Cauchy density (red) leaks mass into the forbidden zone, which is why it "
             "overprices deep OTM options relative to RBS.\n\n"
             "The log-scale panel reveals tail behaviour: RBS drops sharply at the boundary, Gaussian "
-            "decays exponentially, Cauchy decays only as 1/x². The shaded region quantifies the "
-            "probability mass that standard models misallocate to causally forbidden outcomes."
+            "decays exponentially, Cauchy decays only as 1/x²."
         ),
-        "key_insight": "Any density outside the cone is causally forbidden — the light-cone shading shows exactly what BS and Cauchy get wrong.",
+        "key_insight": "Any density outside the cone is causally forbidden. The shaded region shows what BS and Cauchy get wrong.",
     },
     "greeks": {
         "title": "Delta and Gamma — RBS Hedging Surface",
@@ -70,11 +79,9 @@ ANNOTATIONS = {
             "compresses the risk-neutral density near ATM, raising local curvature. Practical "
             "implication: an RBS hedger must rebalance more frequently than a BS hedger for "
             "near-ATM options at moderate τ_rel, but less so for deep ITM.\n\n"
-            "The heatmap colour gradient directly shows where hedging costs will diverge from "
-            "standard BS predictions — useful for identifying which parts of the portfolio are "
-            "most sensitive to relativistic corrections."
+            "The Gamma surface has a clear ATM ridge — rotate it to see the peak shift with τ_rel."
         ),
-        "key_insight": "High Gamma (bright yellow) = expensive to delta-hedge. Watch for the ATM Gamma increase at τ_rel ≈ 0.05–0.15.",
+        "key_insight": "The Gamma ridge peak shifts with τ_rel — rotate to see where hedging cost is highest vs standard BS.",
     },
     "american": {
         "title": "Early-Exercise Premium — When Waiting Is Not Free",
@@ -87,10 +94,9 @@ ANNOTATIONS = {
             "At τ_rel = 0.10, the premium can be 8–10% of the European price for near-ATM options, "
             "versus ~5% in standard BS.\n\n"
             "An options desk using BS to value American puts systematically underprices early exercise "
-            "when τ_rel is non-trivial. The heatmap on the right shows exactly where the mispricing "
-            "is largest — deep ITM options at high τ_rel."
+            "when τ_rel is non-trivial."
         ),
-        "key_insight": "Bright regions in the right heatmap = largest BS mispricing of American exercise. Premium % grows with both ITM-ness and τ_rel.",
+        "key_insight": "The 3D surface shows the early-exercise ridge — highest at deep ITM + high τ_rel. Flat in BS; tilted in RBS.",
     },
     "barrier": {
         "title": "Down-and-Out Barrier Discount — Relativistic Knock-Out",
@@ -100,13 +106,11 @@ ANNOTATIONS = {
             "As H → 0 the barrier never triggers and the price recovers the vanilla call.\n\n"
             "At large τ_rel the barrier discount is smaller for barriers well below spot — the RBS "
             "model assigns less probability to the stock reaching those levels than BS does, consistent "
-            "with light-cone density suppression. Practitioners pricing barrier products with "
-            "relativistic models need less barrier discount near the cone boundary than classical "
-            "models suggest.\n\n"
-            "Notice the inflection point: below H ≈ 75 the discount curves separate by τ_rel; "
+            "with light-cone density suppression.\n\n"
+            "Notice the inflection: below H ≈ 75 the discount curves separate by τ_rel; "
             "above H ≈ 90 all curves converge as the barrier becomes dominant regardless of τ_rel."
         ),
-        "key_insight": "Curves separating below H ≈ 75 shows where τ_rel matters most. The gap between lines is the relativistic correction to barrier pricing.",
+        "key_insight": "The 3D surface cliff near H = S shows where the barrier becomes binding. The τ_rel axis tilts the approach angle.",
     },
     "calibration": {
         "title": "Calibration Landscape — Recovering τ_rel from Market Prices",
@@ -115,21 +119,36 @@ ANNOTATIONS = {
             "τ_true = 0.05, how does the RMSE (in basis points) behave as a function of candidate τ_rel?\n\n"
             "The minimum is sharp and unambiguous — the golden-section search converges to within "
             "9.4e-9 bp error at the true value. RMSE rises steeply on both sides, meaning the "
-            "calibration is well-identified: different τ_rel values produce noticeably different "
-            "IV surfaces.\n\n"
-            "The green shaded region (RMSE < 1 bp) defines the range of τ_rel values consistent "
-            "with sub-basis-point calibration error. In practice, market noise is 1–5 bp, so this "
-            "zone defines the uncertainty on calibrated τ_rel.\n\n"
-            "Notice the asymmetry: RMSE rises faster for τ_rel too large than too small. This is "
-            "because the model becomes weakly identified as τ_rel → 0 (it approaches standard BS "
-            "and loses sensitivity to the parameter)."
+            "calibration is well-identified.\n\n"
+            "The green shaded region (RMSE < 1 bp) defines the uncertainty on calibrated τ_rel given "
+            "realistic market noise of 1–5 bp. The asymmetry (RMSE rises faster for τ_rel too large) "
+            "reflects weak identification as τ_rel → 0 (model approaches BS)."
         ),
-        "key_insight": "The sharp V-shape proves τ_rel is identifiable from IV data. The green zone shows calibration uncertainty given realistic market noise.",
+        "key_insight": "The sharp V-shape proves τ_rel is identifiable from IV data. Green zone = calibration uncertainty at realistic noise levels.",
+    },
+    "comparison": {
+        "title": "Market vs Black-Scholes vs RBS — Three-Way IV Surface Comparison",
+        "body": (
+            "This is the key diagnostic plot. Three implied volatility surfaces are shown together:\n\n"
+            "Market IV (red surface): A realistic equity-style skew — negative slope (OTM puts are "
+            "more expensive than OTM calls at the same moneyness) with slight convexity. At K=70, "
+            "market IV ≈ 23.4%; at K=130, market IV ≈ 17.4%. This shape is universal in equity "
+            "index options and is driven by crash risk and leverage effects.\n\n"
+            "BS IV (blue surface): Perfectly flat at 20% regardless of strike or τ_rel. Black-Scholes "
+            "cannot produce a smile or skew — it is built into the model's log-normal assumption.\n\n"
+            "RBS IV (green surface): A frown — highest at ATM, declining into both wings. The opposite "
+            "direction to market skew, but crucially: RBS at least produces a non-flat surface "
+            "from first principles. The frown deepens with τ_rel.\n\n"
+            "The gap between the market surface and RBS tells you where the model needs extension "
+            "(e.g., adding jump risk or stochastic volatility on top of the relativistic framework). "
+            "Near ATM, all three surfaces converge — this is where BS and RBS are closest to reality."
+        ),
+        "key_insight": "Market skews left (puts expensive), RBS frowns symmetrically, BS is flat. Rotate to see all three surfaces diverge in the wings.",
     },
 }
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="RBS Options Pricer API", version="1.0")
+app = FastAPI(title="RBS Options Pricer API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -141,17 +160,11 @@ app.add_middleware(
 
 def run_csv(mode: str) -> list[dict]:
     """Call rel_bs.exe --csv <mode>, parse stdout CSV, return list of float dicts."""
-    result = subprocess.run(
-        [EXE, "--csv", mode],
-        capture_output=True, text=True
-    )
+    result = subprocess.run([EXE, "--csv", mode], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr or f"rel_bs.exe exited with code {result.returncode}")
+        raise RuntimeError(result.stderr or f"rel_bs.exe exited {result.returncode}")
     reader = csv.DictReader(io.StringIO(result.stdout))
-    rows = []
-    for row in reader:
-        rows.append({k: float(v) for k, v in row.items()})
-    return rows
+    return [{k: float(v) for k, v in row.items()} for row in reader]
 
 
 @app.get("/")
@@ -164,22 +177,72 @@ def meta():
     return {
         "params": {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.20},
         "modes": VALID_MODES,
-        "description": "Relativistic Black-Scholes option pricer. All parameters hardcoded in rel_bs.exe.",
+        "grid_modes": list(GRID_CONFIG.keys()),
     }
 
 
 @app.get("/api/csv/{mode}")
 def csv_endpoint(mode: str):
     if mode not in VALID_MODES:
-        raise HTTPException(status_code=404, detail=f"Unknown mode '{mode}'. Valid: {VALID_MODES}")
+        raise HTTPException(404, f"Unknown mode '{mode}'. Valid: {VALID_MODES}")
     try:
         data = run_csv(mode)
     except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
     return {
         "mode": mode,
         "rows": len(data),
         "columns": list(data[0].keys()) if data else [],
         "data": data,
+        "annotations": ANNOTATIONS[mode],
+    }
+
+
+@app.get("/api/grid/{mode}")
+def grid_endpoint(mode: str):
+    """
+    Returns data reshaped as Plotly-ready x/y/z arrays for 3D surface plots.
+
+    Response:
+      {
+        "x": [K values],            # X axis (nX values)
+        "y": [tau_rel values],      # Y axis (nY values)
+        "surfaces": {               # one 2D array per z column
+          "iv_pct": [[...], ...],   # shape nY × nX
+          ...
+        },
+        "x_label": "K",
+        "y_label": "tau_rel",
+        "annotations": { title, body, key_insight }
+      }
+
+    Plotly usage:
+      Plotly.newPlot(div, [{ type:'surface', x: r.x, y: r.y, z: r.surfaces.iv_pct }])
+    """
+    if mode not in GRID_CONFIG:
+        raise HTTPException(404, f"No grid for '{mode}'. Grid modes: {list(GRID_CONFIG)}")
+    cfg = GRID_CONFIG[mode]
+    try:
+        rows = run_csv(mode)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    df = pd.DataFrame(rows)
+    x_vals = sorted(df[cfg["x"]].unique().tolist())
+    y_vals = sorted(df[cfg["y"]].unique().tolist())
+
+    surfaces = {}
+    for col in cfg["z_cols"]:
+        pivot = df.pivot(index=cfg["y"], columns=cfg["x"], values=col)
+        pivot = pivot.reindex(index=y_vals, columns=x_vals)
+        surfaces[col] = pivot.values.tolist()  # list of lists, shape nY × nX
+
+    return {
+        "mode": mode,
+        "x": x_vals,
+        "y": y_vals,
+        "x_label": cfg["x"],
+        "y_label": cfg["y"],
+        "surfaces": surfaces,
         "annotations": ANNOTATIONS[mode],
     }

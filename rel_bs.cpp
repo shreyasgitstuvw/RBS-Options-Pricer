@@ -2135,6 +2135,48 @@ static void csv_calibration(double S, double T, double r, double sigma) {
     }
 }
 
+// --csv comparison
+// Columns: K, tau_rel, market_iv, bs_iv, rbs_iv
+//
+// market_iv: parametric equity skew (negative skew + slight smile, typical of SPX)
+//   iv_mkt(K) = sigma * (1 − skew_param * x + conv_param * x²)  where x = ln(K/S)
+//   skew_param = 0.30  (OTM puts ~7pp more expensive than OTM calls at same |moneyness|)
+//   conv_param = 0.50  (slight convexity / smile)
+// bs_iv:     flat surface at sigma (BS by construction — no smile, no skew)
+// rbs_iv:    RBS model IV (frown: ATM > wings, symmetric)
+//
+// This three-way comparison directly shows:
+//   - Where RBS agrees with market (ATM region, moderate tau_rel)
+//   - Where RBS diverges from market (skew direction: market has -skew, RBS has +frown)
+//   - Where BS fails both (flat vs both real and RBS surfaces)
+static void csv_comparison(double S, double T, double r, double sigma) {
+    const std::vector<double> strikes  = {70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130};
+    const std::vector<double> tau_rels = {1e-3, 5e-3, 1e-2, 5e-2, 0.10, 0.15, 0.20};
+
+    // Parametric market smile coefficients (realistic equity/index-like surface)
+    const double skew_param = 0.30;  // negative skew: ln(K/S) < 0 → higher IV
+    const double conv_param = 0.50;  // convexity: smile on top of skew
+
+    std::printf("K,tau_rel,market_iv,bs_iv,rbs_iv\n");
+    for (double K : strikes) {
+        const double x   = std::log(K / S);                    // log-moneyness
+        const double x0  = -x;                                  // log(S/K) for grid_interp
+        // Market IV: skew + smile (does not vary with tau_rel — it is "observed")
+        const double iv_mkt = sigma * (1.0 - skew_param * x + conv_param * x * x);
+
+        Grid g = Grid::make(sigma, T, 600, 6.5);
+        for (double tr : tau_rels) {
+            double V      = grid_interp(solve_rbs(sigma, r, T, K, tr, 800, true, g), g, x0);
+            double iv_rbs = implied_vol(V, S, K, T, r, true);
+            std::printf("%.1f,%.6e,%.6f,%.6f,%.6f\n",
+                        K, tr,
+                        iv_mkt * 100.0,   // market IV (%)
+                        sigma  * 100.0,   // BS IV (%) — always flat
+                        iv_rbs * 100.0);  // RBS IV (%)
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     const double S = 100.0, K = 100.0, T = 1.0, r = 0.05, sigma = 0.20;
 
@@ -2147,9 +2189,10 @@ int main(int argc, char* argv[]) {
         else if (mode == "american")    csv_american(S, T, r, sigma);
         else if (mode == "barrier")     csv_barrier(S, T, r, sigma);
         else if (mode == "calibration") csv_calibration(S, T, r, sigma);
+        else if (mode == "comparison")  csv_comparison(S, T, r, sigma);
         else {
             std::fprintf(stderr, "Unknown CSV mode: %s\n", argv[2]);
-            std::fprintf(stderr, "Valid modes: iv_surface density greeks american barrier calibration\n");
+            std::fprintf(stderr, "Valid modes: iv_surface density greeks american barrier calibration comparison\n");
             return 1;
         }
         return 0;
